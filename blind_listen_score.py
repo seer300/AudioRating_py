@@ -7,10 +7,12 @@
     pip install pygame openpyxl
 
 用法:
-    1. 将各场景 wav 放入脚本同级 music/A、music/B ... 目录
-    2. python blind_listen_score.py
+    1. 开发：将各场景 wav 放入脚本同级 music/A、music/B ... 目录
+       python blind_listen_score.py
+    2. 发布：运行 build_exe.bat，生成单文件 exe（music 内嵌，用户不可直接替换）
 
-跨平台: Windows / macOS / Linux（tkinter + pygame）
+跨平台开发: Windows / macOS / Linux（tkinter + pygame）
+打包目标: Windows exe（PyInstaller --onefile）
 """
 
 from __future__ import annotations
@@ -113,16 +115,47 @@ DEBUG_COPY_FIRST_SCENE_SCORES = 0
 # 工具函数
 # =============================================================================
 
-def app_base_dir() -> Path:
-    """程序根目录（开发时=脚本目录；打包成 exe 后=exe 所在目录）。"""
+def resource_dir() -> Path:
+    """
+    只读资源目录（内置 music 等）。
+    - 开发运行: 脚本所在目录
+    - PyInstaller onefile/onedir: sys._MEIPASS（打包进 exe 的解压/资源目录）
+    """
     if getattr(sys, "frozen", False):
-        # PyInstaller / cx_Freeze 等打包后
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            return Path(meipass)
         return Path(sys.executable).resolve().parent
     return Path(__file__).resolve().parent
 
 
+def writable_dir() -> Path:
+    """
+    可写目录（导出 Excel 等）。
+    - 开发运行: 脚本所在目录
+    - 打包后: exe 所在目录（不要写到 _MEIPASS）
+    """
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+def app_base_dir() -> Path:
+    """兼容旧调用：默认指向可写目录。读音频请用 music_root()。"""
+    return writable_dir()
+
+
 def music_root() -> Path:
-    return app_base_dir() / MUSIC_DIR_NAME
+    """音频根目录：打包后从内嵌资源读取，用户无法通过替换 exe 旁文件夹篡改。"""
+    return resource_dir() / MUSIC_DIR_NAME
+
+
+def audio_relpath(path: Path) -> str:
+    """Excel 中记录的相对路径（相对资源根；失败则仅文件名）。"""
+    try:
+        return str(path.relative_to(resource_dir()))
+    except ValueError:
+        return path.name
 
 
 def list_scene_wavs(scene_folder: str) -> List[Path]:
@@ -781,9 +814,14 @@ class BlindListenApp(tk.Tk):
         ttk.Button(frame, text="开始测评", command=self._start_eval).pack(pady=24)
 
         tip = (
-            f"音频目录: {music_root()}\n"
+            "音频已内置于程序中（打包后不可从外部替换）。\n"
             f"场景: {', '.join(SCENE_FOLDERS)}（各约 {NUM_AUDIO_PER_SCENE} 条 wav）"
         )
+        if not getattr(sys, "frozen", False):
+            tip = (
+                f"音频目录: {music_root()}\n"
+                f"场景: {', '.join(SCENE_FOLDERS)}（各约 {NUM_AUDIO_PER_SCENE} 条 wav）"
+            )
         if DEBUG_COPY_FIRST_SCENE_SCORES:
             tip += (
                 "\n\n【调试模式已开启】填完第1个场景后，"
@@ -957,7 +995,7 @@ class BlindListenApp(tk.Tk):
                 "scene_name": display,
                 "code": row.code,
                 "filename": row.path.name,
-                "relpath": str(row.path.relative_to(app_base_dir())),
+                "relpath": audio_relpath(row.path),
             }
             record.update(scores)
             self.results.append(record)
@@ -1002,7 +1040,7 @@ class BlindListenApp(tk.Tk):
                     "scene_name": display,
                     "code": code,
                     "filename": path.name,
-                    "relpath": str(path.relative_to(app_base_dir())),
+                    "relpath": audio_relpath(path),
                 }
                 record.update(src_scores)
                 self.results.append(record)
@@ -1037,7 +1075,7 @@ class BlindListenApp(tk.Tk):
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         safe_name = "".join(c for c in self.evaluator_name if c not in r'\/:*?"<>|').strip()
         out_name = f"{EXCEL_FILENAME_PREFIX}_{safe_name}_{ts}.xlsx"
-        out_path = app_base_dir() / out_name
+        out_path = writable_dir() / out_name
 
         wb = Workbook()
         ws = wb.active
@@ -1153,6 +1191,9 @@ class BlindListenApp(tk.Tk):
 
 
 def ensure_music_dirs() -> None:
+    """仅开发模式下创建 music 目录骨架；打包后音频只读内嵌，不在 exe 旁生成可改目录。"""
+    if getattr(sys, "frozen", False):
+        return
     root = music_root()
     root.mkdir(parents=True, exist_ok=True)
     for folder in SCENE_FOLDERS:

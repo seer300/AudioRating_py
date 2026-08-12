@@ -1,46 +1,41 @@
-# 打包说明（Windows → 免 Python 环境运行）
+# 打包说明（单 exe，音频内嵌，防止用户替换）
 
 ## 一键打包
 
-1. 确认本机已装 **Python 3.12**，且能运行：
-   ```bat
-   python blind_listen_score.py
+1. 确认本机已装 **Python 3.12**，且 `music\A`…`G` 中已放好 wav。
+2. 正式测评请确认脚本中：
+   ```python
+   DEBUG_COPY_FIRST_SCENE_SCORES = 0
    ```
-2. 双击运行：
+3. 双击运行：
    ```bat
    build_exe.bat
    ```
-3. 打包结果在：
+4. 得到单个文件：
    ```
-   dist\盲听音频评分工具\
+   dist\盲听音频评分工具.exe
    ```
-   把**整个文件夹**拷到没有 Python 的电脑上，运行其中的 `盲听音频评分工具.exe`。
+   拷贝这一个 exe 到目标电脑即可，**不要**再附带 music 文件夹。
 
-## 目录结构（发布时）
+## 行为说明
 
-```
-盲听音频评分工具/
-  ├─ 盲听音频评分工具.exe
-  ├─ 若干依赖 dll/库文件
-  └─ music/
-       ├─ A\  (10个 wav)
-       ├─ B\
-       └─ ...
-```
+| 内容 | 位置 |
+|------|------|
+| 测评 wav | 打进 exe 内部，运行时只读，普通用户无法替换 |
+| 评分 Excel | 写在 exe 所在目录 |
 
-`music` 与 exe 同级；可事后替换 wav，不必重新打包。
+更换音频源后，必须重新打包，不能靠改外部文件夹热更新。
 
 ## 注意
 
-- 正式测评前，把脚本里 `DEBUG_COPY_FIRST_SCENE_SCORES = 0`，再重新打包。
-- 目标电脑需要有扬声器/耳机，否则会提示连接音频设备。
-- 若杀毒软件误报，可将整个发布目录加入白名单（PyInstaller 常见现象）。
-- 需要「单个 exe 文件」时，可把 `build_exe.bat` 里命令改成加 `--onefile`（启动会慢一些，且 `music` 仍建议放在 exe 旁边）。
+- 目标电脑需要扬声器/耳机。
+- 首次启动 onefile 会稍慢（解压到临时目录）。
+- 若杀毒软件误报，将 exe 加入白名单。
+- 这只能提高篡改门槛，无法做到绝对防破解。
 
-## 手动命令（可选）
+## 手动命令
 
 ```bat
 pip install pyinstaller pygame openpyxl
-pyinstaller --noconfirm --clean --windowed --name "盲听音频评分工具" --collect-all pygame --collect-all openpyxl blind_listen_score.py
-xcopy /E /I /Y music dist\盲听音频评分工具\music
+pyinstaller --noconfirm --clean --onefile --windowed --name "盲听音频评分工具" --add-data "music;music" --collect-all pygame --collect-all openpyxl blind_listen_score.py
 ```
