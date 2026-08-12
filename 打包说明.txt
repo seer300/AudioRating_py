@@ -1,0 +1,46 @@
+# 打包说明（Windows → 免 Python 环境运行）
+
+## 一键打包
+
+1. 确认本机已装 **Python 3.12**，且能运行：
+   ```bat
+   python blind_listen_score.py
+   ```
+2. 双击运行：
+   ```bat
+   build_exe.bat
+   ```
+3. 打包结果在：
+   ```
+   dist\盲听音频评分工具\
+   ```
+   把**整个文件夹**拷到没有 Python 的电脑上，运行其中的 `盲听音频评分工具.exe`。
+
+## 目录结构（发布时）
+
+```
+盲听音频评分工具/
+  ├─ 盲听音频评分工具.exe
+  ├─ 若干依赖 dll/库文件
+  └─ music/
+       ├─ A\  (10个 wav)
+       ├─ B\
+       └─ ...
+```
+
+`music` 与 exe 同级；可事后替换 wav，不必重新打包。
+
+## 注意
+
+- 正式测评前，把脚本里 `DEBUG_COPY_FIRST_SCENE_SCORES = 0`，再重新打包。
+- 目标电脑需要有扬声器/耳机，否则会提示连接音频设备。
+- 若杀毒软件误报，可将整个发布目录加入白名单（PyInstaller 常见现象）。
+- 需要「单个 exe 文件」时，可把 `build_exe.bat` 里命令改成加 `--onefile`（启动会慢一些，且 `music` 仍建议放在 exe 旁边）。
+
+## 手动命令（可选）
+
+```bat
+pip install pyinstaller pygame openpyxl
+pyinstaller --noconfirm --clean --windowed --name "盲听音频评分工具" --collect-all pygame --collect-all openpyxl blind_listen_score.py
+xcopy /E /I /Y music dist\盲听音频评分工具\music
+```

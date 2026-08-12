@@ -1,0 +1,1193 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+盲听音频评分工具（单文件版）
+
+依赖安装:
+    pip install pygame openpyxl
+
+用法:
+    1. 将各场景 wav 放入脚本同级 music/A、music/B ... 目录
+    2. python blind_listen_score.py
+
+跨平台: Windows / macOS / Linux（tkinter + pygame）
+"""
+
+from __future__ import annotations
+
+import array
+import os
+import struct
+import sys
+import tempfile
+import threading
+import wave
+import tkinter as tk
+from tkinter import ttk, messagebox, simpledialog
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+# WAV 格式常量（Python wave 模块不支持 format=3 的 IEEE float）
+WAVE_FORMAT_PCM = 1
+WAVE_FORMAT_IEEE_FLOAT = 3
+WAVE_FORMAT_EXTENSIBLE = 0xFFFE
+
+# ---------------------------------------------------------------------------
+# 依赖检查
+# ---------------------------------------------------------------------------
+try:
+    import pygame
+except ImportError:
+    print("请先安装 pygame:  pip install pygame")
+    sys.exit(1)
+
+try:
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, Alignment, Border, Side
+except ImportError:
+    print("请先安装 openpyxl:  pip install openpyxl")
+    sys.exit(1)
+
+
+# =============================================================================
+# 配置宏定义（可按需修改）
+# =============================================================================
+
+# 音频根目录名（相对本脚本所在目录）
+MUSIC_DIR_NAME = "music"
+
+# 七个场景文件夹名（顺序即测评顺序）
+SCENE_FOLDERS = ["A", "B", "C", "D", "E", "F", "G"]
+
+# 场景对外展示名（与 SCENE_FOLDERS 一一对应；可改成中文场景名）
+SCENE_DISPLAY_NAMES = [
+    "场景1",
+    "场景2",
+    "场景3",
+    "场景4",
+    "场景5",
+    "场景6",
+    "场景7",
+]
+
+# 每个场景期望的音频数量
+NUM_AUDIO_PER_SCENE = 10
+
+# 支持的音频扩展名（盲听仅用 wav）
+AUDIO_EXTENSIONS = (".wav", ".WAV")
+
+# 界面编号位数，如 01、02
+CODE_LABEL_WIDTH = 2
+
+# 评分维度: (内部键, 界面显示名)
+SCORE_DIMENSIONS: List[Tuple[str, str]] = [
+    ("clarity", "清晰度"),
+    ("fidelity", "还原度"),
+    ("s_mos", "S_MOS"),
+    ("n_mos", "N_MOS"),
+    ("g_mos", "G_MOS"),
+]
+
+# 分数范围与精度
+SCORE_MIN = 0.0
+SCORE_MAX = 5.0
+SCORE_STEP = 0.1
+
+# Excel 输出文件名前缀
+EXCEL_FILENAME_PREFIX = "盲听评分结果"
+
+# 进度条刷新间隔（毫秒）
+PROGRESS_TICK_MS = 100
+
+# ---------------------------------------------------------------------------
+# 调试宏开关
+# 1 = 只认真填写第 1 个场景；点击完成后，将其余场景按同编号(01~10)
+#     原样复制五维评分，并直接导出 Excel（便于快速检查表格格式）
+# 0 = 正式测评（需逐场景填写全部评分）
+# ---------------------------------------------------------------------------
+DEBUG_COPY_FIRST_SCENE_SCORES = 0
+
+
+# =============================================================================
+# 工具函数
+# =============================================================================
+
+def app_base_dir() -> Path:
+    """程序根目录（开发时=脚本目录；打包成 exe 后=exe 所在目录）。"""
+    if getattr(sys, "frozen", False):
+        # PyInstaller / cx_Freeze 等打包后
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+def music_root() -> Path:
+    return app_base_dir() / MUSIC_DIR_NAME
+
+
+def list_scene_wavs(scene_folder: str) -> List[Path]:
+    """按文件名排序列出场景下的 wav；数量由目录实际内容决定。"""
+    folder = music_root() / scene_folder
+    if not folder.is_dir():
+        return []
+    files = [
+        p for p in folder.iterdir()
+        if p.is_file() and p.suffix in AUDIO_EXTENSIONS
+    ]
+    return sorted(files, key=lambda p: p.name.lower())
+
+
+def parse_wav_info(path: Path) -> dict:
+    """
+    解析 WAV 头信息，支持:
+      - format 1: PCM 整型
+      - format 3: IEEE float（你遇到的 unknown format: 3）
+      - format 0xFFFE: WAVE_FORMAT_EXTENSIBLE
+    """
+    with open(path, "rb") as f:
+        header = f.read(12)
+        if len(header) < 12 or header[0:4] != b"RIFF" or header[8:12] != b"WAVE":
+            raise ValueError("不是有效的 WAV / RIFF 文件")
+
+        audio_format = None
+        channels = None
+        sample_rate = None
+        byte_rate = None
+        bits_per_sample = None
+        data_size = None
+        data_offset = None
+
+        while True:
+            chunk_hdr = f.read(8)
+            if len(chunk_hdr) < 8:
+                break
+            chunk_id, chunk_size = struct.unpack("<4sI", chunk_hdr)
+            # 防止异常超大 chunk
+            if chunk_size > 1 << 31:
+                raise ValueError(f"异常 WAV chunk 大小: {chunk_id!r}")
+
+            if chunk_id == b"fmt ":
+                fmt = f.read(chunk_size)
+                if len(fmt) < 16:
+                    raise ValueError("fmt chunk 过短")
+                audio_format, channels, sample_rate, byte_rate, _block_align, bits_per_sample = (
+                    struct.unpack("<HHIIHH", fmt[:16])
+                )
+                # Extensible: 实际格式在 SubFormat GUID 前 2 字节
+                if audio_format == WAVE_FORMAT_EXTENSIBLE and len(fmt) >= 26:
+                    audio_format = struct.unpack("<H", fmt[24:26])[0]
+            elif chunk_id == b"data":
+                data_offset = f.tell()
+                data_size = chunk_size
+                f.seek(chunk_size, os.SEEK_CUR)
+            else:
+                f.seek(chunk_size, os.SEEK_CUR)
+
+            # chunk 偶数字节对齐
+            if chunk_size % 2 == 1:
+                f.seek(1, os.SEEK_CUR)
+
+    if None in (audio_format, channels, sample_rate, bits_per_sample, data_size, data_offset):
+        raise ValueError("WAV 缺少 fmt/data 信息")
+    if sample_rate <= 0 or channels <= 0 or bits_per_sample <= 0:
+        raise ValueError("WAV 参数非法")
+
+    bytes_per_sample = bits_per_sample // 8
+    if bytes_per_sample <= 0:
+        raise ValueError(f"不支持的位深: {bits_per_sample}")
+    frame_size = channels * bytes_per_sample
+    nframes = data_size // frame_size
+    duration = nframes / float(sample_rate)
+
+    return {
+        "audio_format": audio_format,
+        "channels": channels,
+        "sample_rate": sample_rate,
+        "byte_rate": byte_rate,
+        "bits_per_sample": bits_per_sample,
+        "data_size": data_size,
+        "data_offset": data_offset,
+        "nframes": nframes,
+        "duration": duration,
+    }
+
+
+def wav_duration_seconds(path: Path) -> float:
+    """读取 wav 时长（秒），兼容 PCM / IEEE float。"""
+    return float(parse_wav_info(path)["duration"])
+
+
+def _read_wav_pcm16_bytes(path: Path) -> Tuple[bytes, int, int]:
+    """
+    读取任意常见 WAV，返回 (int16 PCM 交错字节流, sample_rate, channels)。
+    float32 / float64 会裁剪到 [-1, 1] 再转 int16。
+    """
+    info = parse_wav_info(path)
+    fmt = info["audio_format"]
+    channels = info["channels"]
+    rate = info["sample_rate"]
+    bps = info["bits_per_sample"]
+
+    with open(path, "rb") as f:
+        f.seek(info["data_offset"])
+        raw = f.read(info["data_size"])
+
+    if fmt == WAVE_FORMAT_PCM and bps == 16:
+        return raw, rate, channels
+
+    if fmt == WAVE_FORMAT_PCM and bps == 8:
+        # 8bit PCM 为无符号
+        samples = array.array("B", raw)
+        out = array.array("h", ((s - 128) << 8 for s in samples))
+        return out.tobytes(), rate, channels
+
+    if fmt == WAVE_FORMAT_PCM and bps == 24:
+        n = len(raw) // 3
+        out = array.array("h")
+        for i in range(n):
+            b0, b1, b2 = raw[i * 3 : i * 3 + 3]
+            val = b0 | (b1 << 8) | (b2 << 16)
+            if val & 0x800000:
+                val -= 0x1000000
+            out.append(max(-32768, min(32767, val >> 8)))
+        return out.tobytes(), rate, channels
+
+    if fmt == WAVE_FORMAT_PCM and bps == 32:
+        samples = array.array("i")
+        samples.frombytes(raw[: len(raw) - (len(raw) % 4)])
+        if sys.byteorder != "little":
+            samples.byteswap()
+        out = array.array("h", (max(-32768, min(32767, s >> 16)) for s in samples))
+        return out.tobytes(), rate, channels
+
+    if fmt == WAVE_FORMAT_IEEE_FLOAT and bps == 32:
+        samples = array.array("f")
+        samples.frombytes(raw[: len(raw) - (len(raw) % 4)])
+        if sys.byteorder != "little":
+            samples.byteswap()
+        out = array.array(
+            "h",
+            (max(-32768, min(32767, int(max(-1.0, min(1.0, s)) * 32767.0))) for s in samples),
+        )
+        return out.tobytes(), rate, channels
+
+    if fmt == WAVE_FORMAT_IEEE_FLOAT and bps == 64:
+        samples = array.array("d")
+        samples.frombytes(raw[: len(raw) - (len(raw) % 8)])
+        if sys.byteorder != "little":
+            samples.byteswap()
+        out = array.array(
+            "h",
+            (max(-32768, min(32767, int(max(-1.0, min(1.0, s)) * 32767.0))) for s in samples),
+        )
+        return out.tobytes(), rate, channels
+
+    raise ValueError(f"暂不支持的 WAV 格式: format={fmt}, bits={bps}")
+
+
+def ensure_playable_wav(path: Path, cache_dir: Path) -> Path:
+    """
+    返回 pygame 可直接播放的 PCM16 wav 路径。
+    对 IEEE float（format=3）等会转换并缓存到临时目录。
+    """
+    info = parse_wav_info(path)
+    if info["audio_format"] == WAVE_FORMAT_PCM and info["bits_per_sample"] == 16:
+        return path
+
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    # 用源文件签名避免重复转换
+    stamp = f"{path.stat().st_mtime_ns}_{path.stat().st_size}"
+    out = cache_dir / f"{path.stem}__pcm16__{stamp}.wav"
+    if out.is_file():
+        return out
+
+    pcm, rate, channels = _read_wav_pcm16_bytes(path)
+    with wave.open(str(out), "wb") as wf:
+        wf.setnchannels(channels)
+        wf.setsampwidth(2)
+        wf.setframerate(rate)
+        wf.writeframes(pcm)
+    return out
+
+
+class AudioDeviceError(RuntimeError):
+    """无可用音频输出设备，或初始化超时/失败。"""
+
+
+def _mixer_init_once(driver: Optional[str]) -> None:
+    if driver:
+        os.environ["SDL_AUDIODRIVER"] = driver
+    else:
+        os.environ.pop("SDL_AUDIODRIVER", None)
+    try:
+        pygame.mixer.quit()
+    except Exception:
+        pass
+    pygame.mixer.init(frequency=44100, size=-16, channels=2, buffer=2048)
+
+
+def init_pygame_mixer(timeout_sec: float = 4.0) -> str:
+    """
+    初始化音频设备；Windows 上 WASAPI 失败时回退 directsound / winmm。
+    单次尝试超过 timeout_sec 视为无设备/卡死，抛出 AudioDeviceError。
+    返回实际使用的驱动名（可能为空字符串表示默认）。
+    """
+    drivers: List[Optional[str]]
+    if sys.platform.startswith("win"):
+        drivers = ["directsound", "winmm", "wasapi", None]
+    elif sys.platform == "darwin":
+        drivers = ["coreaudio", None]
+    else:
+        drivers = ["pulseaudio", "alsa", None]
+
+    last_err: Optional[BaseException] = None
+    for driver in drivers:
+        box: Dict[str, object] = {"ok": False, "err": None}
+
+        def _worker(d: Optional[str] = driver) -> None:
+            try:
+                _mixer_init_once(d)
+                box["ok"] = True
+            except BaseException as exc:  # noqa: BLE001 - 需捕获 pygame 底层异常
+                box["err"] = exc
+
+        th = threading.Thread(target=_worker, daemon=True)
+        th.start()
+        th.join(timeout_sec)
+        if th.is_alive():
+            # 初始化卡住通常就是没有输出设备，直接提示，避免多驱动轮询拖很久
+            raise AudioDeviceError(
+                "音频设备初始化超时，可能未连接耳机/扬声器。\n"
+                "请连接音频设备后重新打开本程序。"
+            )
+        if box["ok"]:
+            return driver or ""
+        last_err = box["err"] if isinstance(box["err"], BaseException) else last_err
+
+    raise AudioDeviceError(
+        "未检测到可用的音频输出设备。\n"
+        "请连接耳机或扬声器后，重新打开本程序。\n\n"
+        f"详细信息: {last_err}"
+    )
+
+
+def show_audio_device_error(detail: object = None) -> None:
+    """弹窗提示连接音频设备（不依赖主窗口）。"""
+    msg = (
+        "未检测到音频设备。\n\n"
+        "请连接耳机或扬声器后，重新打开本程序。"
+    )
+    if detail:
+        msg += f"\n\n详细信息:\n{detail}"
+    root = tk.Tk()
+    root.withdraw()
+    try:
+        root.attributes("-topmost", True)
+    except tk.TclError:
+        pass
+    messagebox.showerror("请连接音频设备", msg, parent=root)
+    try:
+        root.destroy()
+    except tk.TclError:
+        pass
+
+
+def format_time(seconds: float) -> str:
+    seconds = max(0.0, float(seconds))
+    m = int(seconds) // 60
+    s = int(seconds) % 60
+    return f"{m:02d}:{s:02d}"
+
+
+def quantize_score(value: float) -> float:
+    """量化到 SCORE_STEP 精度。"""
+    steps = round(value / SCORE_STEP)
+    return round(steps * SCORE_STEP, 1)
+
+
+def is_valid_score(text: str) -> bool:
+    """校验：0~5，步进 0.1（如 0.1、3.5 合法；5.1、3.22 非法）。"""
+    try:
+        v = float(text.strip())
+    except ValueError:
+        return False
+    if v < SCORE_MIN or v > SCORE_MAX:
+        return False
+    q = quantize_score(v)
+    return abs(v - q) < 1e-9
+
+
+def code_label(index: int) -> str:
+    """0-based index -> '01' 形式。"""
+    return f"{index + 1:0{CODE_LABEL_WIDTH}d}"
+
+
+# =============================================================================
+# 音频播放器（pygame，支持拖动定位）
+# =============================================================================
+
+class WavPlayer:
+    """同一时刻只播放一条音频。"""
+
+    def __init__(self) -> None:
+        self._driver = init_pygame_mixer()
+        self.path: Optional[Path] = None
+        self._play_path: Optional[Path] = None
+        self.duration: float = 0.0
+        self._seek_base: float = 0.0  # play(start=...) 的起点
+        self._paused: bool = False
+        self._pause_pos: float = 0.0
+        self._cache_dir = Path(tempfile.gettempdir()) / "blind_listen_pcm_cache"
+
+    def load(self, path: Path, duration: float) -> None:
+        self.stop()
+        self.path = path
+        self.duration = duration
+        self._seek_base = 0.0
+        self._paused = False
+        self._pause_pos = 0.0
+        # float WAV 等先转成 PCM16，pygame 才能稳定播放
+        self._play_path = ensure_playable_wav(path, self._cache_dir)
+        pygame.mixer.music.load(str(self._play_path))
+
+    def play(self, start: float = 0.0) -> None:
+        if self.path is None or self._play_path is None:
+            return
+        start = max(0.0, min(start, max(0.0, self.duration - 0.05)))
+        self._seek_base = start
+        self._paused = False
+        # pygame 2+: play(start=seconds) 对 wav 可用
+        pygame.mixer.music.play(start=start)
+
+    def pause(self) -> None:
+        if not pygame.mixer.music.get_busy() and not self._paused:
+            return
+        self._pause_pos = self.get_position()
+        pygame.mixer.music.pause()
+        self._paused = True
+
+    def unpause(self) -> None:
+        if self._paused:
+            # 部分平台 pause/unpause 对 set_pos 不稳定，用重新 play 更稳妥
+            self.play(self._pause_pos)
+            self._paused = False
+
+    def stop(self) -> None:
+        try:
+            pygame.mixer.music.stop()
+        except pygame.error:
+            pass
+        self._seek_base = 0.0
+        self._paused = False
+        self._pause_pos = 0.0
+
+    def is_playing(self) -> bool:
+        return (not self._paused) and pygame.mixer.music.get_busy()
+
+    def is_paused(self) -> bool:
+        return self._paused
+
+    def get_position(self) -> float:
+        if self._paused:
+            return self._pause_pos
+        if not pygame.mixer.music.get_busy():
+            # 播放结束
+            if self.path is not None and self._seek_base > 0:
+                # 刚结束时 get_pos 可能为 -1
+                return self.duration
+            pos_ms = pygame.mixer.music.get_pos()
+            if pos_ms < 0:
+                return self.duration if self._seek_base > 0 or self.path else 0.0
+            return min(self.duration, self._seek_base + pos_ms / 1000.0)
+        pos_ms = pygame.mixer.music.get_pos()
+        if pos_ms < 0:
+            return self._seek_base
+        return min(self.duration, self._seek_base + pos_ms / 1000.0)
+
+    def seek(self, seconds: float) -> None:
+        was_playing = self.is_playing() or self.is_paused()
+        if was_playing or self.path is not None:
+            self.play(seconds)
+
+    def shutdown(self) -> None:
+        self.stop()
+        try:
+            pygame.mixer.quit()
+        except Exception:
+            pass
+
+# =============================================================================
+# 单条音频行 UI
+# =============================================================================
+
+class AudioRow:
+    def __init__(
+        self,
+        parent: tk.Widget,
+        index: int,
+        path: Path,
+        player: WavPlayer,
+        on_play_request,
+    ) -> None:
+        self.index = index
+        self.path = path
+        self.player = player
+        self.on_play_request = on_play_request
+        self.code = code_label(index)
+        self.duration = 0.0
+        self._seeking = False
+        self._active = False  # 当前是否由本行占用播放器
+
+        try:
+            self.duration = wav_duration_seconds(path)
+        except Exception as exc:
+            messagebox.showwarning(
+                "音频读取失败",
+                f"{path.name}\n{exc}\n\n"
+                "提示: 若曾出现 unknown format: 3，说明是 IEEE float WAV，"
+                "当前版本已支持该格式，请确认已保存最新脚本后重试。",
+            )
+            self.duration = 0.0
+
+        self.frame = ttk.LabelFrame(parent, text=f"音频 {self.code}", padding=6)
+
+        top = ttk.Frame(self.frame)
+        top.pack(fill=tk.X)
+
+        self.btn_play = ttk.Button(top, text="▶ 播放", width=10, command=self.toggle_play)
+        self.btn_play.pack(side=tk.LEFT, padx=(0, 6))
+
+        self.progress = ttk.Scale(
+            top,
+            from_=0.0,
+            to=max(self.duration, 0.1),
+            orient=tk.HORIZONTAL,
+            command=self._on_seek_drag,
+        )
+        self.progress.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
+        self.progress.bind("<ButtonPress-1>", self._seek_press)
+        self.progress.bind("<ButtonRelease-1>", self._seek_release)
+
+        self.time_var = tk.StringVar(value=f"00:00 / {format_time(self.duration)}")
+        ttk.Label(top, textvariable=self.time_var, width=14).pack(side=tk.LEFT)
+
+        score_frame = ttk.Frame(self.frame)
+        score_frame.pack(fill=tk.X, pady=(8, 0))
+
+        self.score_vars: Dict[str, tk.StringVar] = {}
+        self.score_widgets: Dict[str, ttk.Spinbox] = {}
+
+        vcmd = (self.frame.register(self._validate_score_key), "%P")
+
+        for col, (key, title) in enumerate(SCORE_DIMENSIONS):
+            cell = ttk.Frame(score_frame)
+            cell.grid(row=0, column=col, padx=4, sticky="ew")
+            score_frame.columnconfigure(col, weight=1)
+            ttk.Label(cell, text=title).pack(anchor="w")
+            var = tk.StringVar(value="")
+            self.score_vars[key] = var
+            spin = ttk.Spinbox(
+                cell,
+                from_=SCORE_MIN,
+                to=SCORE_MAX,
+                increment=SCORE_STEP,
+                textvariable=var,
+                width=8,
+                format="%.1f",
+                validate="key",
+                validatecommand=vcmd,
+            )
+            spin.pack(fill=tk.X)
+            self.score_widgets[key] = spin
+
+    def pack(self, **kwargs) -> None:
+        self.frame.pack(**kwargs)
+
+    @staticmethod
+    def _validate_score_key(new_value: str) -> bool:
+        """输入过程允许空、中间态；完整值再严格校验。"""
+        if new_value == "" or new_value in (".", "-", "0.", "1.", "2.", "3.", "4.", "5."):
+            return True
+        try:
+            v = float(new_value)
+        except ValueError:
+            return False
+        if v < SCORE_MIN or v > SCORE_MAX + 1e-9:
+            return False
+        # 最多一位小数
+        if "." in new_value:
+            frac = new_value.split(".", 1)[1]
+            if len(frac) > 1:
+                return False
+        return True
+
+    def _seek_press(self, _event=None) -> None:
+        self._seeking = True
+
+    def _seek_release(self, _event=None) -> None:
+        self._seeking = False
+        if self._active:
+            pos = float(self.progress.get())
+            self.player.seek(pos)
+            self._refresh_time(pos)
+
+    def _on_seek_drag(self, value: str) -> None:
+        if not self._seeking:
+            return
+        try:
+            pos = float(value)
+        except ValueError:
+            return
+        self._refresh_time(pos)
+
+    def toggle_play(self) -> None:
+        if self._active and self.player.is_playing():
+            self.player.pause()
+            self.btn_play.configure(text="▶ 继续")
+            return
+        if self._active and self.player.is_paused():
+            self.player.unpause()
+            self.btn_play.configure(text="⏸ 暂停")
+            return
+        # 请求成为当前播放行
+        self.on_play_request(self)
+
+    def start_playback(self, from_pos: Optional[float] = None) -> None:
+        pos = float(self.progress.get()) if from_pos is None else from_pos
+        try:
+            self.player.load(self.path, self.duration)
+            self.player.play(pos)
+        except Exception as exc:
+            self._active = False
+            self.btn_play.configure(text="▶ 播放")
+            messagebox.showerror("播放失败", f"{self.path.name}\n{exc}")
+            return
+        self._active = True
+        self.btn_play.configure(text="⏸ 暂停")
+
+    def deactivate(self) -> None:
+        self._active = False
+        self.btn_play.configure(text="▶ 播放")
+        self.progress.set(0.0)
+        self._refresh_time(0.0)
+
+    def on_stopped_externally(self) -> None:
+        self._active = False
+        self.btn_play.configure(text="▶ 播放")
+
+    def tick(self) -> None:
+        if not self._active or self._seeking:
+            return
+        if self.player.is_paused():
+            return
+        pos = self.player.get_position()
+        if not self.player.is_playing():
+            # 播放结束
+            pos = self.duration
+            self.progress.set(pos)
+            self._refresh_time(pos)
+            self.btn_play.configure(text="▶ 播放")
+            self._active = False
+            return
+        self.progress.set(pos)
+        self._refresh_time(pos)
+
+    def _refresh_time(self, pos: float) -> None:
+        self.time_var.set(f"{format_time(pos)} / {format_time(self.duration)}")
+
+    def get_scores(self) -> Optional[Dict[str, float]]:
+        scores: Dict[str, float] = {}
+        for key, _title in SCORE_DIMENSIONS:
+            text = self.score_vars[key].get().strip()
+            if not is_valid_score(text):
+                return None
+            scores[key] = quantize_score(float(text))
+        return scores
+
+    def missing_or_invalid_dims(self) -> List[str]:
+        bad: List[str] = []
+        for key, title in SCORE_DIMENSIONS:
+            text = self.score_vars[key].get().strip()
+            if not is_valid_score(text):
+                bad.append(title)
+        return bad
+
+
+# =============================================================================
+# 主应用
+# =============================================================================
+
+class BlindListenApp(tk.Tk):
+    def __init__(self) -> None:
+        super().__init__()
+        self.title("盲听音频评分工具")
+        self.geometry("980x720")
+        self.minsize(860, 600)
+
+        self.evaluator_name = ""
+        self.scene_index = 0
+        self.player: Optional[WavPlayer] = None
+        self.rows: List[AudioRow] = []
+        self.active_row: Optional[AudioRow] = None
+        # results: list of dict records
+        self.results: List[dict] = []
+
+        try:
+            self.player = WavPlayer()
+        except (AudioDeviceError, pygame.error) as exc:
+            show_audio_device_error(exc)
+            self.destroy()
+            raise SystemExit(1) from exc
+
+        self._build_style()
+        self._show_name_screen()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.after(PROGRESS_TICK_MS, self._progress_loop)
+
+    def _build_style(self) -> None:
+        style = ttk.Style(self)
+        # 尽量使用系统原生主题
+        for theme in ("vista", "aqua", "clam", style.theme_use()):
+            if theme in style.theme_names():
+                try:
+                    style.theme_use(theme)
+                    break
+                except tk.TclError:
+                    continue
+
+    # ----- 姓名页 -----
+    def _show_name_screen(self) -> None:
+        self._clear_root()
+        frame = ttk.Frame(self, padding=40)
+        frame.pack(expand=True)
+
+        ttk.Label(frame, text="盲听音频评分", font=("", 18, "bold")).pack(pady=(0, 12))
+        ttk.Label(
+            frame,
+            text="开始前请输入评分人姓名。测评过程中界面仅显示编号，不显示真实文件名。",
+            wraplength=520,
+            justify=tk.CENTER,
+        ).pack(pady=(0, 24))
+
+        form = ttk.Frame(frame)
+        form.pack()
+        ttk.Label(form, text="姓名：").grid(row=0, column=0, sticky="e", padx=(0, 8))
+        self.name_var = tk.StringVar()
+        entry = ttk.Entry(form, textvariable=self.name_var, width=28)
+        entry.grid(row=0, column=1)
+        entry.focus_set()
+        entry.bind("<Return>", lambda _e: self._start_eval())
+
+        ttk.Button(frame, text="开始测评", command=self._start_eval).pack(pady=24)
+
+        tip = (
+            f"音频目录: {music_root()}\n"
+            f"场景: {', '.join(SCENE_FOLDERS)}（各约 {NUM_AUDIO_PER_SCENE} 条 wav）"
+        )
+        if DEBUG_COPY_FIRST_SCENE_SCORES:
+            tip += (
+                "\n\n【调试模式已开启】填完第1个场景后，"
+                "后续场景评分将按同编号自动复制并导出 Excel。"
+                "\n正式测评请将 DEBUG_COPY_FIRST_SCENE_SCORES 改为 0。"
+            )
+        ttk.Label(frame, text=tip, foreground="#555", justify=tk.CENTER).pack()
+
+    def _start_eval(self) -> None:
+        name = self.name_var.get().strip()
+        if not name:
+            messagebox.showwarning("提示", "请输入评分人姓名。")
+            return
+        self.evaluator_name = name
+
+        # 启动前检查目录
+        missing = []
+        for folder in SCENE_FOLDERS:
+            wavs = list_scene_wavs(folder)
+            if len(wavs) == 0:
+                missing.append(f"{folder}/ （无 wav）")
+            elif len(wavs) != NUM_AUDIO_PER_SCENE:
+                missing.append(
+                    f"{folder}/ （找到 {len(wavs)} 个，期望 {NUM_AUDIO_PER_SCENE} 个）"
+                )
+        if any("无 wav" in m for m in missing):
+            messagebox.showerror(
+                "音频目录不完整",
+                "以下场景缺少音频，请检查后重试：\n\n" + "\n".join(missing),
+            )
+            return
+        if missing:
+            ok = messagebox.askyesno(
+                "音频数量提示",
+                "以下场景音频数量与期望不符，是否仍继续？\n\n" + "\n".join(missing),
+            )
+            if not ok:
+                return
+
+        self.scene_index = 0
+        self.results.clear()
+        self._show_scene_screen()
+
+    # ----- 场景页 -----
+    def _show_scene_screen(self) -> None:
+        self._stop_playback()
+        self._clear_root()
+
+        scene_folder = SCENE_FOLDERS[self.scene_index]
+        display = SCENE_DISPLAY_NAMES[self.scene_index] if self.scene_index < len(
+            SCENE_DISPLAY_NAMES
+        ) else scene_folder
+        wavs = list_scene_wavs(scene_folder)
+
+        header = ttk.Frame(self, padding=(12, 10))
+        header.pack(fill=tk.X)
+        ttk.Label(
+            header,
+            text=f"评分人：{self.evaluator_name}",
+        ).pack(side=tk.LEFT)
+        ttk.Label(
+            header,
+            text=f"{display}（文件夹 {scene_folder}）  "
+                 f"{self.scene_index + 1}/{len(SCENE_FOLDERS)}",
+            font=("", 12, "bold"),
+        ).pack(side=tk.LEFT, padx=24)
+        ttk.Label(
+            header,
+            text="请为每条音频五个维度打分（0.0–5.0，步进 0.1）",
+        ).pack(side=tk.RIGHT)
+
+        # 可滚动区域
+        body = ttk.Frame(self)
+        body.pack(fill=tk.BOTH, expand=True, padx=8, pady=4)
+
+        canvas = tk.Canvas(body, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(body, orient=tk.VERTICAL, command=canvas.yview)
+        self.scroll_inner = ttk.Frame(canvas)
+
+        self.scroll_inner.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all")),
+        )
+        self._canvas_window = canvas.create_window((0, 0), window=self.scroll_inner, anchor="nw")
+        canvas.bind(
+            "<Configure>",
+            lambda e: canvas.itemconfigure(self._canvas_window, width=e.width),
+        )
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # 鼠标滚轮（跨平台）
+        def _on_mousewheel(event):
+            if sys.platform == "darwin":
+                canvas.yview_scroll(-1 * int(event.delta), "units")
+            else:
+                canvas.yview_scroll(-1 * int(event.delta / 120), "units")
+
+        def _on_linux_scroll(event):
+            canvas.yview_scroll(-1 if event.num == 4 else 1, "units")
+
+        canvas.bind_all("<MouseWheel>", _on_mousewheel)
+        canvas.bind_all("<Button-4>", _on_linux_scroll)
+        canvas.bind_all("<Button-5>", _on_linux_scroll)
+        self._canvas = canvas
+
+        self.rows = []
+        for i, path in enumerate(wavs):
+            row = AudioRow(self.scroll_inner, i, path, self.player, self._on_play_request)
+            row.pack(fill=tk.X, padx=4, pady=6)
+            self.rows.append(row)
+
+        footer = ttk.Frame(self, padding=12)
+        footer.pack(fill=tk.X)
+        ttk.Button(footer, text="退出", command=self._on_close).pack(side=tk.LEFT)
+
+        is_last = self.scene_index >= len(SCENE_FOLDERS) - 1
+        if DEBUG_COPY_FIRST_SCENE_SCORES and self.scene_index == 0:
+            next_text = "完成并导出 Excel（调试：复制到其余场景）"
+        elif is_last:
+            next_text = "完成并导出 Excel"
+        else:
+            next_text = "下一场景"
+        ttk.Button(footer, text=next_text, command=self._next_scene).pack(side=tk.RIGHT)
+
+    def _on_play_request(self, row: AudioRow) -> None:
+        if self.active_row is not None and self.active_row is not row:
+            self.player.stop()
+            self.active_row.on_stopped_externally()
+            self.active_row.progress.set(0.0)
+            self.active_row._refresh_time(0.0)
+        self.active_row = row
+        row.start_playback()
+
+    def _stop_playback(self) -> None:
+        self.player.stop()
+        if self.active_row is not None:
+            self.active_row.on_stopped_externally()
+            self.active_row = None
+
+    def _progress_loop(self) -> None:
+        if self.active_row is not None:
+            self.active_row.tick()
+            if not self.active_row._active:
+                self.active_row = None
+        self.after(PROGRESS_TICK_MS, self._progress_loop)
+
+    def _collect_current_scene(self) -> bool:
+        scene_folder = SCENE_FOLDERS[self.scene_index]
+        display = SCENE_DISPLAY_NAMES[self.scene_index] if self.scene_index < len(
+            SCENE_DISPLAY_NAMES
+        ) else scene_folder
+
+        for row in self.rows:
+            bad = row.missing_or_invalid_dims()
+            if bad:
+                messagebox.showwarning(
+                    "评分不完整或非法",
+                    f"音频 {row.code} 以下维度无效（需 0.0–5.0，步进 0.1）：\n"
+                    + "、".join(bad),
+                )
+                return False
+
+        for row in self.rows:
+            scores = row.get_scores()
+            assert scores is not None
+            record = {
+                "evaluator": self.evaluator_name,
+                "scene_folder": scene_folder,
+                "scene_name": display,
+                "code": row.code,
+                "filename": row.path.name,
+                "relpath": str(row.path.relative_to(app_base_dir())),
+            }
+            record.update(scores)
+            self.results.append(record)
+        return True
+
+    def _scores_by_code_from_first_scene(self) -> Dict[str, Dict[str, float]]:
+        """从已收集的第1个场景结果中，按代号取出五维分数。"""
+        first_folder = SCENE_FOLDERS[0]
+        mapping: Dict[str, Dict[str, float]] = {}
+        for rec in self.results:
+            if rec["scene_folder"] != first_folder:
+                continue
+            mapping[rec["code"]] = {
+                key: float(rec[key]) for key, _title in SCORE_DIMENSIONS
+            }
+        return mapping
+
+    def _auto_fill_remaining_scenes_from_first(self) -> None:
+        """调试：把第1个场景的同编号评分复制到后续全部场景。"""
+        score_map = self._scores_by_code_from_first_scene()
+        if not score_map:
+            raise RuntimeError("调试复制失败：第1个场景没有可用评分。")
+
+        for idx in range(1, len(SCENE_FOLDERS)):
+            scene_folder = SCENE_FOLDERS[idx]
+            display = (
+                SCENE_DISPLAY_NAMES[idx]
+                if idx < len(SCENE_DISPLAY_NAMES)
+                else scene_folder
+            )
+            wavs = list_scene_wavs(scene_folder)
+            for i, path in enumerate(wavs):
+                code = code_label(i)
+                # 优先同编号；若后续场景条数不同，则按序号循环取第1场景分数
+                src_scores = score_map.get(code)
+                if src_scores is None:
+                    codes = list(score_map.keys())
+                    src_scores = score_map[codes[i % len(codes)]]
+                record = {
+                    "evaluator": self.evaluator_name,
+                    "scene_folder": scene_folder,
+                    "scene_name": display,
+                    "code": code,
+                    "filename": path.name,
+                    "relpath": str(path.relative_to(app_base_dir())),
+                }
+                record.update(src_scores)
+                self.results.append(record)
+
+    def _next_scene(self) -> None:
+        if not self._collect_current_scene():
+            return
+        self._stop_playback()
+
+        # 调试宏：第1场景填完后，自动复制并导出
+        if DEBUG_COPY_FIRST_SCENE_SCORES and self.scene_index == 0:
+            try:
+                self._auto_fill_remaining_scenes_from_first()
+            except Exception as exc:
+                messagebox.showerror("调试复制失败", str(exc))
+                return
+            messagebox.showinfo(
+                "调试模式",
+                "已将第1个场景的评分按同编号复制到其余场景，即将导出 Excel。\n"
+                "正式测评请把 DEBUG_COPY_FIRST_SCENE_SCORES 改为 0。",
+            )
+            self._export_excel()
+            return
+
+        if self.scene_index >= len(SCENE_FOLDERS) - 1:
+            self._export_excel()
+            return
+        self.scene_index += 1
+        self._show_scene_screen()
+
+    def _export_excel(self) -> None:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        safe_name = "".join(c for c in self.evaluator_name if c not in r'\/:*?"<>|').strip()
+        out_name = f"{EXCEL_FILENAME_PREFIX}_{safe_name}_{ts}.xlsx"
+        out_path = app_base_dir() / out_name
+
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "评分明细"
+
+        headers = [
+            "评分人",
+            "场景名称",
+            "场景文件夹",
+            "代号",
+            "音频文件名",
+            "相对路径",
+        ] + [title for _k, title in SCORE_DIMENSIONS]
+
+        ws.append(headers)
+        for rec in self.results:
+            row = [
+                rec["evaluator"],
+                rec["scene_name"],
+                rec["scene_folder"],
+                rec["code"],
+                rec["filename"],
+                rec["relpath"],
+            ]
+            for key, _title in SCORE_DIMENSIONS:
+                row.append(rec[key])
+            ws.append(row)
+
+        # 映射表：代号 <-> 真实文件名
+        ws2 = wb.create_sheet("文件名映射")
+        ws2.append(["场景名称", "场景文件夹", "代号", "音频文件名", "相对路径"])
+        seen = set()
+        for rec in self.results:
+            key = (rec["scene_folder"], rec["code"])
+            if key in seen:
+                continue
+            seen.add(key)
+            ws2.append([
+                rec["scene_name"],
+                rec["scene_folder"],
+                rec["code"],
+                rec["filename"],
+                rec["relpath"],
+            ])
+
+        thin = Border(
+            left=Side(style="thin"),
+            right=Side(style="thin"),
+            top=Side(style="thin"),
+            bottom=Side(style="thin"),
+        )
+        for sheet in (ws, ws2):
+            for cell in sheet[1]:
+                cell.font = Font(bold=True)
+                cell.alignment = Alignment(horizontal="center")
+            for row in sheet.iter_rows(min_row=1, max_row=sheet.max_row, max_col=sheet.max_column):
+                for cell in row:
+                    cell.border = thin
+            for col in sheet.columns:
+                max_len = 0
+                col_letter = col[0].column_letter
+                for cell in col:
+                    max_len = max(max_len, len(str(cell.value or "")))
+                sheet.column_dimensions[col_letter].width = min(max_len + 4, 48)
+
+        try:
+            wb.save(str(out_path))
+        except OSError as exc:
+            messagebox.showerror("保存失败", str(exc))
+            return
+
+        messagebox.showinfo(
+            "导出完成",
+            f"共 {len(self.results)} 条评分已保存：\n{out_path}",
+        )
+        self._show_done_screen(out_path)
+
+    def _show_done_screen(self, out_path: Path) -> None:
+        self._stop_playback()
+        self._clear_root()
+        frame = ttk.Frame(self, padding=40)
+        frame.pack(expand=True)
+        ttk.Label(frame, text="测评完成", font=("", 18, "bold")).pack(pady=(0, 12))
+        ttk.Label(
+            frame,
+            text=f"结果文件：\n{out_path}",
+            justify=tk.CENTER,
+        ).pack(pady=(0, 20))
+        ttk.Button(frame, text="再评一次", command=self._show_name_screen).pack(pady=4)
+        ttk.Button(frame, text="退出", command=self._on_close).pack(pady=4)
+
+    def _clear_root(self) -> None:
+        try:
+            if hasattr(self, "_canvas"):
+                self.unbind_all("<MouseWheel>")
+                self.unbind_all("<Button-4>")
+                self.unbind_all("<Button-5>")
+        except tk.TclError:
+            pass
+        for child in self.winfo_children():
+            child.destroy()
+        self.rows = []
+        self.active_row = None
+
+    def _on_close(self) -> None:
+        if self.results and self.scene_index < len(SCENE_FOLDERS) - 1:
+            # 可能有未完成数据；已写入 results 的场景已收集
+            pass
+        if messagebox.askokcancel("退出", "确定退出？未完成导出的评分将丢失。"):
+            if self.player is not None:
+                self.player.shutdown()
+            self.destroy()
+
+
+def ensure_music_dirs() -> None:
+    root = music_root()
+    root.mkdir(parents=True, exist_ok=True)
+    for folder in SCENE_FOLDERS:
+        (root / folder).mkdir(parents=True, exist_ok=True)
+
+
+def probe_audio_device() -> None:
+    """启动前探测音频设备；失败则弹窗并退出进程。"""
+    try:
+        init_pygame_mixer()
+        try:
+            pygame.mixer.quit()
+        except Exception:
+            pass
+    except (AudioDeviceError, pygame.error, OSError, TimeoutError) as exc:
+        show_audio_device_error(exc)
+        sys.exit(1)
+
+
+def main() -> None:
+    ensure_music_dirs()
+    # 先探测音频，避免无设备时主界面卡死
+    probe_audio_device()
+    try:
+        app = BlindListenApp()
+    except SystemExit:
+        raise
+    except (AudioDeviceError, pygame.error) as exc:
+        show_audio_device_error(exc)
+        sys.exit(1)
+    except Exception as exc:
+        show_audio_device_error(exc)
+        sys.exit(1)
+    app.mainloop()
+
+
+if __name__ == "__main__":
+    main()
