@@ -687,6 +687,11 @@ class AudioRow:
 
     def start_playback(self, from_pos: Optional[float] = None) -> None:
         pos = float(self.progress.get()) if from_pos is None else from_pos
+        # 已播到末尾时再次播放，从 0 重播
+        if self.duration > 0 and pos >= max(0.0, self.duration - 0.05):
+            pos = 0.0
+            self.progress.set(0.0)
+            self._refresh_time(0.0)
         try:
             self.player.load(self.path, self.duration)
             self.player.play(pos)
