@@ -538,9 +538,18 @@ class WavPlayer:
         return min(self.duration, self._seek_base + pos_ms / 1000.0)
 
     def seek(self, seconds: float) -> None:
-        was_playing = self.is_playing() or self.is_paused()
-        if was_playing or self.path is not None:
+        seconds = max(0.0, min(float(seconds), max(0.0, self.duration - 0.05) if self.duration > 0 else 0.0))
+        if self.is_paused():
+            # 暂停时只更新位置，不恢复播放
+            self._pause_pos = seconds
+            self._seek_base = seconds
+            return
+        if self.is_playing():
             self.play(seconds)
+            return
+        # 未在播：仅记录起点，供下次 play 使用
+        self._seek_base = seconds
+        self._pause_pos = seconds
 
     def shutdown(self) -> None:
         self.stop()
@@ -598,7 +607,9 @@ class AudioRow:
             command=self._on_seek_drag,
         )
         self.progress.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
+        # ttk.Scale 多数主题不支持点槽跳转；用鼠标坐标换算实现点击/拖槽定位
         self.progress.bind("<ButtonPress-1>", self._seek_press)
+        self.progress.bind("<B1-Motion>", self._seek_motion)
         self.progress.bind("<ButtonRelease-1>", self._seek_release)
 
         self.time_var = tk.StringVar(value=f"00:00 / {format_time(self.duration)}")
@@ -654,17 +665,52 @@ class AudioRow:
                 return False
         return True
 
-    def _seek_press(self, _event=None) -> None:
-        self._seeking = True
+    def _progress_pos_from_event(self, event) -> float:
+        """按点击/拖动的 x 坐标换算为进度秒数（不换控件）。"""
+        width = max(int(self.progress.winfo_width()), 1)
+        # 两端略留白，减少点到滑块边缘时的偏差
+        pad = 8
+        usable = max(width - 2 * pad, 1)
+        frac = (event.x - pad) / usable
+        frac = min(1.0, max(0.0, frac))
+        vmin = float(self.progress.cget("from"))
+        vmax = float(self.progress.cget("to"))
+        if vmax < vmin:
+            vmin, vmax = vmax, vmin
+        return vmin + (vmax - vmin) * frac
 
-    def _seek_release(self, _event=None) -> None:
-        self._seeking = False
-        if self._active:
-            pos = float(self.progress.get())
+    def _apply_progress_pos(self, pos: float, *, seek_player: bool) -> None:
+        pos = max(0.0, min(float(self.progress.cget("to")), float(pos)))
+        self.progress.set(pos)
+        self._refresh_time(pos)
+        if seek_player and self._active:
             self.player.seek(pos)
-            self._refresh_time(pos)
+
+    def _seek_press(self, event) -> None:
+        self._seeking = True
+        pos = self._progress_pos_from_event(event)
+        # 按下时先跳到点击位置（点槽即可跳转）
+        self._apply_progress_pos(pos, seek_player=False)
+
+    def _seek_motion(self, event) -> None:
+        if not self._seeking:
+            return
+        pos = self._progress_pos_from_event(event)
+        self._apply_progress_pos(pos, seek_player=False)
+
+    def _seek_release(self, event=None) -> None:
+        if not self._seeking:
+            return
+        self._seeking = False
+        if event is not None:
+            pos = self._progress_pos_from_event(event)
+        else:
+            pos = float(self.progress.get())
+        # 松开时同步播放器位置：播放中会跳转；暂停中只改位置不播
+        self._apply_progress_pos(pos, seek_player=True)
 
     def _on_seek_drag(self, value: str) -> None:
+        # 保留 Scale 自身拖滑块时的回调；与坐标换算互补
         if not self._seeking:
             return
         try:
