@@ -114,6 +114,55 @@ def dimensions_for_scene(scene_index: int) -> List[Tuple[str, str]]:
 def scene_type_label(scene_index: int) -> str:
     return "人声质量" if scene_index == VOICE_QUALITY_SCENE_INDEX else "噪声场景"
 
+
+# ---------------------------------------------------------------------------
+# 评分标准表（打分界面右侧常驻展示）
+# 只需改 headers / rows 文案即可；rows 每一行对应表格一行
+# ---------------------------------------------------------------------------
+
+# 场景1：人声质量（示例已填 5/4 分，其余请自行补全）
+VOICE_SCORE_RUBRIC: Dict[str, object] = {
+    "title": "人声质量评分标准",
+    "headers": ["分数", "清晰度", "还原度"],
+    "rows": [
+        [
+            "5 优秀",
+            "吐字字字清晰，无模糊吞字，无噪声失真，听音毫不费力",
+            "音色高度还原原声，气息细节完整，听感自然真实，无畸变",
+        ],
+        [
+            "4 良好",
+            "大部分字词清晰，仅个别轻微模糊，微弱噪声失真，不影响理解",
+            "大部分字词清晰，仅个别轻微模糊，微弱噪声失真，不影响理解",
+        ],
+        ["3 中等", "（待填写）", "（待填写）"],
+        ["2 较差", "（待填写）", "（待填写）"],
+        ["1 很差", "（待填写）", "（待填写）"],
+        # ["0 分", "（待填写）", "（待填写）"],
+    ],
+}
+
+# 场景2~8：噪声场景（三列维度，请自行填写各分行描述）
+NOISE_SCORE_RUBRIC: Dict[str, object] = {
+    "title": "噪声场景评分标准",
+    "headers": ["分数", "S_MOS", "N_MOS", "G_MOS"],
+    "rows": [
+        ["5 优秀", "（待填写）", "（待填写）", "（待填写）"],
+        ["4 良好", "（待填写）", "（待填写）", "（待填写）"],
+        ["3 中等", "（待填写）", "（待填写）", "（待填写）"],
+        ["2 较差", "（待填写）", "（待填写）", "（待填写）"],
+        ["1 很差", "（待填写）", "（待填写）", "（待填写）"],
+        # ["0 分", "（待填写）", "（待填写）", "（待填写）"],
+    ],
+}
+
+
+def rubric_for_scene(scene_index: int) -> Dict[str, object]:
+    if scene_index == VOICE_QUALITY_SCENE_INDEX:
+        return VOICE_SCORE_RUBRIC
+    return NOISE_SCORE_RUBRIC
+
+
 # 分数范围与精度
 SCORE_MIN = 0.0
 SCORE_MAX = 5.0
@@ -823,6 +872,111 @@ class AudioRow:
 
 
 # =============================================================================
+# 评分标准侧栏面板（常驻显示）
+# =============================================================================
+
+class ScoreRubricPanel(ttk.Frame):
+    """在打分界面右侧常驻展示当前场景评分标准。"""
+
+    def __init__(self, master: tk.Widget, scene_index: int, **kwargs) -> None:
+        super().__init__(master, **kwargs)
+        rubric = rubric_for_scene(scene_index)
+        title = str(rubric.get("title", "评分标准"))
+        scene_name = (
+            SCENE_DISPLAY_NAMES[scene_index]
+            if scene_index < len(SCENE_DISPLAY_NAMES)
+            else f"场景{scene_index + 1}"
+        )
+        headers = list(rubric.get("headers") or [])
+        rows = list(rubric.get("rows") or [])
+        col_count = max(len(headers), 1)
+        body_labels: List[ttk.Label] = []
+
+        ttk.Label(self, text=title, font=("", 12, "bold")).pack(anchor="w", pady=(0, 2))
+        ttk.Label(
+            self,
+            text=f"{scene_name}\n分值 {SCORE_MIN}–{SCORE_MAX}，步进 {SCORE_STEP}",
+            foreground="#444",
+            justify=tk.LEFT,
+        ).pack(anchor="w", pady=(0, 8))
+
+        table_wrap = ttk.Frame(self)
+        table_wrap.pack(fill=tk.BOTH, expand=True)
+
+        canvas = tk.Canvas(table_wrap, highlightthickness=0)
+        vsb = ttk.Scrollbar(table_wrap, orient=tk.VERTICAL, command=canvas.yview)
+        inner = ttk.Frame(canvas)
+        inner.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all")),
+        )
+        canvas_window = canvas.create_window((0, 0), window=inner, anchor="nw")
+        canvas.configure(yscrollcommand=vsb.set)
+
+        def _on_canvas_configure(event):
+            canvas.itemconfigure(canvas_window, width=event.width)
+            new_wrap = max(120, (event.width - 100) // max(col_count - 1, 1))
+            for lbl in body_labels:
+                lbl.configure(wraplength=new_wrap)
+
+        def _on_wheel(event):
+            if sys.platform == "darwin":
+                canvas.yview_scroll(-1 * int(event.delta), "units")
+            else:
+                canvas.yview_scroll(-1 * int(event.delta / 120), "units")
+            return "break"
+
+        def _on_linux_scroll(event):
+            canvas.yview_scroll(-1 if event.num == 4 else 1, "units")
+            return "break"
+
+        canvas.bind("<Configure>", _on_canvas_configure)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        vsb.pack(side=tk.RIGHT, fill=tk.Y)
+        for w in (canvas, inner):
+            w.bind("<MouseWheel>", _on_wheel)
+            w.bind("<Button-4>", _on_linux_scroll)
+            w.bind("<Button-5>", _on_linux_scroll)
+
+        for c, text in enumerate(headers):
+            cell = ttk.Label(
+                inner,
+                text=str(text),
+                font=("", 9, "bold"),
+                borderwidth=1,
+                relief="solid",
+                padding=4,
+                anchor="center",
+            )
+            cell.grid(row=0, column=c, sticky="nsew")
+            inner.columnconfigure(c, weight=1 if c > 0 else 0, minsize=72 if c == 0 else 120)
+
+        wrap = 160 if col_count >= 3 else 220
+        for r, row in enumerate(rows, start=1):
+            row_vals = list(row) if isinstance(row, (list, tuple)) else [row]
+            while len(row_vals) < col_count:
+                row_vals.append("")
+            for c in range(col_count):
+                text = str(row_vals[c])
+                cell = ttk.Label(
+                    inner,
+                    text=text,
+                    borderwidth=1,
+                    relief="solid",
+                    padding=4,
+                    anchor="nw" if c > 0 else "center",
+                    wraplength=wrap if c > 0 else 72,
+                    justify=tk.LEFT if c > 0 else tk.CENTER,
+                )
+                cell.grid(row=r, column=c, sticky="nsew")
+                if c > 0:
+                    body_labels.append(cell)
+                    cell.bind("<MouseWheel>", _on_wheel)
+                    cell.bind("<Button-4>", _on_linux_scroll)
+                    cell.bind("<Button-5>", _on_linux_scroll)
+
+
+# =============================================================================
 # 主应用
 # =============================================================================
 
@@ -830,8 +984,8 @@ class BlindListenApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title("盲听音频评分工具")
-        self.geometry("980x720")
-        self.minsize(860, 600)
+        self.geometry("1500x800")
+        self.minsize(1280, 700)
 
         self.evaluator_name = ""
         self.scene_index = 0
@@ -974,12 +1128,19 @@ class BlindListenApp(tk.Tk):
             text=f"请为每条音频打分：从0.0到5.0，步进 0.1，鼠标滚轮可快速调整分数",
         ).pack(side=tk.RIGHT)
 
-        # 可滚动区域
-        body = ttk.Frame(self)
-        body.pack(fill=tk.BOTH, expand=True, padx=8, pady=4)
+        # 左右分栏：左侧音频打分，右侧评分标准（常驻）
+        paned = ttk.Panedwindow(self, orient=tk.HORIZONTAL)
+        paned.pack(fill=tk.BOTH, expand=True, padx=8, pady=4)
 
-        canvas = tk.Canvas(body, highlightthickness=0)
-        scrollbar = ttk.Scrollbar(body, orient=tk.VERTICAL, command=canvas.yview)
+        left = ttk.Frame(paned)
+        right_box = ttk.LabelFrame(paned, text="评分标准（常驻参考）", padding=8)
+        paned.add(left, weight=3)
+        paned.add(right_box, weight=2)
+
+        ScoreRubricPanel(right_box, self.scene_index).pack(fill=tk.BOTH, expand=True)
+
+        canvas = tk.Canvas(left, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(left, orient=tk.VERTICAL, command=canvas.yview)
         self.scroll_inner = ttk.Frame(canvas)
 
         self.scroll_inner.bind(
@@ -995,7 +1156,7 @@ class BlindListenApp(tk.Tk):
         canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
-        # 鼠标滚轮（跨平台）
+        # 左侧音频区滚轮（进入时绑定，避免与右侧标准表抢滚动）
         def _on_mousewheel(event):
             if sys.platform == "darwin":
                 canvas.yview_scroll(-1 * int(event.delta), "units")
@@ -1005,10 +1166,21 @@ class BlindListenApp(tk.Tk):
         def _on_linux_scroll(event):
             canvas.yview_scroll(-1 if event.num == 4 else 1, "units")
 
-        canvas.bind_all("<MouseWheel>", _on_mousewheel)
-        canvas.bind_all("<Button-4>", _on_linux_scroll)
-        canvas.bind_all("<Button-5>", _on_linux_scroll)
+        def _bind_left_wheel(_event=None):
+            canvas.bind_all("<MouseWheel>", _on_mousewheel)
+            canvas.bind_all("<Button-4>", _on_linux_scroll)
+            canvas.bind_all("<Button-5>", _on_linux_scroll)
+
+        def _unbind_left_wheel(_event=None):
+            canvas.unbind_all("<MouseWheel>")
+            canvas.unbind_all("<Button-4>")
+            canvas.unbind_all("<Button-5>")
+
+        left.bind("<Enter>", _bind_left_wheel)
+        left.bind("<Leave>", _unbind_left_wheel)
+        canvas.bind("<Enter>", _bind_left_wheel)
         self._canvas = canvas
+        _bind_left_wheel()
 
         self.rows = []
         for i, path in enumerate(wavs):
@@ -1022,6 +1194,17 @@ class BlindListenApp(tk.Tk):
             )
             row.pack(fill=tk.X, padx=4, pady=6)
             self.rows.append(row)
+
+        # 初始分割比例：左侧约 58%，右侧约 42%
+        def _set_sash():
+            try:
+                total = paned.winfo_width()
+                if total > 100:
+                    paned.sashpos(0, int(total * 0.58))
+            except tk.TclError:
+                pass
+
+        self.after(50, _set_sash)
 
         footer = ttk.Frame(self, padding=12)
         footer.pack(fill=tk.X)
