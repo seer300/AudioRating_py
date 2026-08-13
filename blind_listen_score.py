@@ -59,7 +59,7 @@ except ImportError:
 # 音频根目录名（相对本脚本所在目录）
 MUSIC_DIR_NAME = "music"
 
-# 七个场景文件夹名（顺序即测评顺序）
+# 八个场景文件夹名（顺序即测评顺序）
 SCENE_FOLDERS = ["A", "B", "C", "D", "E", "F", "G", "H"]
 
 # 场景对外展示名（与 SCENE_FOLDERS 一一对应；可改成中文场景名）
@@ -74,6 +74,9 @@ SCENE_DISPLAY_NAMES = [
     "场景8:噪声场景-7",
 ]
 
+# 第几个场景为人声质量评分（0-based）；该场景仅评 1 个维度
+VOICE_QUALITY_SCENE_INDEX = 0
+
 # 每个场景期望的音频数量
 NUM_AUDIO_PER_SCENE = 10
 
@@ -83,14 +86,33 @@ AUDIO_EXTENSIONS = (".wav", ".WAV")
 # 界面编号位数，如 01、02
 CODE_LABEL_WIDTH = 2
 
-# 评分维度: (内部键, 界面显示名)
-SCORE_DIMENSIONS: List[Tuple[str, str]] = [
-    ("clarity", "清晰度"),
-    ("fidelity", "还原度"),
-    ("s_mos", "S_MOS"),
-    ("n_mos", "N_MOS"),
-    ("g_mos", "G_MOS"),
+# 场景1：人声质量（仅 1 维）
+VOICE_SCENE_DIMENSIONS: List[Tuple[str, str]] = [
+    ("speech_quality", "语音质量（清晰度&还原度）"),
 ]
+
+# 场景2~8：噪声场景（3 维）
+NOISE_SCENE_DIMENSIONS: List[Tuple[str, str]] = [
+    ("s_mos", "S_mos:人声信号（只看语音失真）"),
+    ("n_mos", "N_MOS:背景噪声（只看噪声扰人程度）"),
+    ("g_mos", "G_MOS:总体质量（综合听感）"),
+]
+
+# Excel 统一导出的全部评分列（本场景不适用的维度留空）
+ALL_SCORE_DIMENSIONS: List[Tuple[str, str]] = (
+    VOICE_SCENE_DIMENSIONS + NOISE_SCENE_DIMENSIONS
+)
+
+
+def dimensions_for_scene(scene_index: int) -> List[Tuple[str, str]]:
+    """按场景返回需要填写的评分维度。"""
+    if scene_index == VOICE_QUALITY_SCENE_INDEX:
+        return VOICE_SCENE_DIMENSIONS
+    return NOISE_SCENE_DIMENSIONS
+
+
+def scene_type_label(scene_index: int) -> str:
+    return "人声质量" if scene_index == VOICE_QUALITY_SCENE_INDEX else "噪声场景"
 
 # 分数范围与精度
 SCORE_MIN = 0.0
@@ -106,7 +128,7 @@ PROGRESS_TICK_MS = 100
 # ---------------------------------------------------------------------------
 # 调试宏开关
 # 1 = 只认真填写第 1 个场景；点击完成后，将其余场景按同编号(01~10)
-#     原样复制五维评分，并直接导出 Excel（便于快速检查表格格式）
+#     复制评分并直接导出 Excel（噪声场景维度不同时，用第1场景分数填入各维便于测表）
 # 0 = 正式测评（需逐场景填写全部评分）
 # ---------------------------------------------------------------------------
 DEBUG_COPY_FIRST_SCENE_SCORES = 0
@@ -571,11 +593,13 @@ class AudioRow:
         path: Path,
         player: WavPlayer,
         on_play_request,
+        dimensions: Optional[List[Tuple[str, str]]] = None,
     ) -> None:
         self.index = index
         self.path = path
         self.player = player
         self.on_play_request = on_play_request
+        self.dimensions = list(dimensions or NOISE_SCENE_DIMENSIONS)
         self.code = code_label(index)
         self.duration = 0.0
         self._seeking = False
@@ -624,7 +648,7 @@ class AudioRow:
 
         vcmd = (self.frame.register(self._validate_score_key), "%P")
 
-        for col, (key, title) in enumerate(SCORE_DIMENSIONS):
+        for col, (key, title) in enumerate(self.dimensions):
             cell = ttk.Frame(score_frame)
             cell.grid(row=0, column=col, padx=4, sticky="ew")
             score_frame.columnconfigure(col, weight=1)
@@ -637,7 +661,7 @@ class AudioRow:
                 to=SCORE_MAX,
                 increment=SCORE_STEP,
                 textvariable=var,
-                width=8,
+                width=10,
                 format="%.1f",
                 validate="key",
                 validatecommand=vcmd,
@@ -782,7 +806,7 @@ class AudioRow:
 
     def get_scores(self) -> Optional[Dict[str, float]]:
         scores: Dict[str, float] = {}
-        for key, _title in SCORE_DIMENSIONS:
+        for key, _title in self.dimensions:
             text = self.score_vars[key].get().strip()
             if not is_valid_score(text):
                 return None
@@ -791,7 +815,7 @@ class AudioRow:
 
     def missing_or_invalid_dims(self) -> List[str]:
         bad: List[str] = []
-        for key, title in SCORE_DIMENSIONS:
+        for key, title in self.dimensions:
             text = self.score_vars[key].get().strip()
             if not is_valid_score(text):
                 bad.append(title)
@@ -939,13 +963,15 @@ class BlindListenApp(tk.Tk):
         ).pack(side=tk.LEFT)
         ttk.Label(
             header,
-            text=f"{display}（文件夹 {scene_folder}）  "
+            text=f"{display}  "
                  f"{self.scene_index + 1}/{len(SCENE_FOLDERS)}",
             font=("", 12, "bold"),
         ).pack(side=tk.LEFT, padx=24)
+        dims = dimensions_for_scene(self.scene_index)
+        dim_names = "、".join(title for _k, title in dims)
         ttk.Label(
             header,
-            text="请为每条音频五个维度打分（0.0–5.0，步进 0.1）",
+            text=f"请为每条音频打分：从0.0到5.0，步进 0.1，鼠标滚轮可快速调整分数",
         ).pack(side=tk.RIGHT)
 
         # 可滚动区域
@@ -986,7 +1012,14 @@ class BlindListenApp(tk.Tk):
 
         self.rows = []
         for i, path in enumerate(wavs):
-            row = AudioRow(self.scroll_inner, i, path, self.player, self._on_play_request)
+            row = AudioRow(
+                self.scroll_inner,
+                i,
+                path,
+                self.player,
+                self._on_play_request,
+                dimensions=dims,
+            )
             row.pack(fill=tk.X, padx=4, pady=6)
             self.rows.append(row)
 
@@ -1048,24 +1081,32 @@ class BlindListenApp(tk.Tk):
                 "evaluator": self.evaluator_name,
                 "scene_folder": scene_folder,
                 "scene_name": display,
+                "scene_type": scene_type_label(self.scene_index),
                 "code": row.code,
                 "filename": row.path.name,
                 "relpath": audio_relpath(row.path),
             }
+            # 全部评分列先置空，再写入本场景实际维度
+            for key, _title in ALL_SCORE_DIMENSIONS:
+                record[key] = ""
             record.update(scores)
             self.results.append(record)
         return True
 
     def _scores_by_code_from_first_scene(self) -> Dict[str, Dict[str, float]]:
-        """从已收集的第1个场景结果中，按代号取出五维分数。"""
+        """从已收集的第1个场景结果中，按代号取出已填分数。"""
         first_folder = SCENE_FOLDERS[0]
         mapping: Dict[str, Dict[str, float]] = {}
         for rec in self.results:
             if rec["scene_folder"] != first_folder:
                 continue
-            mapping[rec["code"]] = {
-                key: float(rec[key]) for key, _title in SCORE_DIMENSIONS
-            }
+            vals: Dict[str, float] = {}
+            for key, _title in ALL_SCORE_DIMENSIONS:
+                raw = rec.get(key, "")
+                if raw == "" or raw is None:
+                    continue
+                vals[key] = float(raw)
+            mapping[rec["code"]] = vals
         return mapping
 
     def _auto_fill_remaining_scenes_from_first(self) -> None:
@@ -1081,23 +1122,29 @@ class BlindListenApp(tk.Tk):
                 if idx < len(SCENE_DISPLAY_NAMES)
                 else scene_folder
             )
+            target_dims = dimensions_for_scene(idx)
             wavs = list_scene_wavs(scene_folder)
             for i, path in enumerate(wavs):
                 code = code_label(i)
-                # 优先同编号；若后续场景条数不同，则按序号循环取第1场景分数
                 src_scores = score_map.get(code)
                 if src_scores is None:
                     codes = list(score_map.keys())
                     src_scores = score_map[codes[i % len(codes)]]
+                # 维度不一致时（人声→噪声），用源场景已有分数填入目标各维，便于测表
+                seed = next(iter(src_scores.values()), 3.0)
                 record = {
                     "evaluator": self.evaluator_name,
                     "scene_folder": scene_folder,
                     "scene_name": display,
+                    "scene_type": scene_type_label(idx),
                     "code": code,
                     "filename": path.name,
                     "relpath": audio_relpath(path),
                 }
-                record.update(src_scores)
+                for key, _title in ALL_SCORE_DIMENSIONS:
+                    record[key] = ""
+                for key, _title in target_dims:
+                    record[key] = src_scores[key] if key in src_scores else seed
                 self.results.append(record)
 
     def _next_scene(self) -> None:
@@ -1139,29 +1186,32 @@ class BlindListenApp(tk.Tk):
         headers = [
             "评分人",
             "场景名称",
+            "场景类型",
             "场景文件夹",
             "代号",
             "音频文件名",
             "相对路径",
-        ] + [title for _k, title in SCORE_DIMENSIONS]
+        ] + [title for _k, title in ALL_SCORE_DIMENSIONS]
 
         ws.append(headers)
         for rec in self.results:
             row = [
                 rec["evaluator"],
                 rec["scene_name"],
+                rec.get("scene_type", ""),
                 rec["scene_folder"],
                 rec["code"],
                 rec["filename"],
                 rec["relpath"],
             ]
-            for key, _title in SCORE_DIMENSIONS:
-                row.append(rec[key])
+            for key, _title in ALL_SCORE_DIMENSIONS:
+                val = rec.get(key, "")
+                row.append("" if val is None else val)
             ws.append(row)
 
         # 映射表：代号 <-> 真实文件名
         ws2 = wb.create_sheet("文件名映射")
-        ws2.append(["场景名称", "场景文件夹", "代号", "音频文件名", "相对路径"])
+        ws2.append(["场景名称", "场景类型", "场景文件夹", "代号", "音频文件名", "相对路径"])
         seen = set()
         for rec in self.results:
             key = (rec["scene_folder"], rec["code"])
@@ -1170,11 +1220,40 @@ class BlindListenApp(tk.Tk):
             seen.add(key)
             ws2.append([
                 rec["scene_name"],
+                rec.get("scene_type", ""),
                 rec["scene_folder"],
                 rec["code"],
                 rec["filename"],
                 rec["relpath"],
             ])
+
+        # 维度说明
+        ws3 = wb.create_sheet("评分维度说明")
+        ws3.append(["场景类型", "适用场景", "需评分维度", "分值范围"])
+        ws3.append([
+            "人声质量",
+            SCENE_DISPLAY_NAMES[VOICE_QUALITY_SCENE_INDEX]
+            if VOICE_QUALITY_SCENE_INDEX < len(SCENE_DISPLAY_NAMES)
+            else "场景1",
+            "、".join(t for _k, t in VOICE_SCENE_DIMENSIONS),
+            f"{SCORE_MIN}–{SCORE_MAX}，步进 {SCORE_STEP}",
+        ])
+        noise_names = [
+            SCENE_DISPLAY_NAMES[i]
+            for i in range(len(SCENE_FOLDERS))
+            if i != VOICE_QUALITY_SCENE_INDEX and i < len(SCENE_DISPLAY_NAMES)
+        ]
+        ws3.append([
+            "噪声场景",
+            "；".join(noise_names),
+            "、".join(t for _k, t in NOISE_SCENE_DIMENSIONS),
+            f"{SCORE_MIN}–{SCORE_MAX}，步进 {SCORE_STEP}",
+        ])
+        ws3.append([])
+        ws3.append([
+            "说明",
+            "评分明细表中，本场景不适用的维度单元格为空。",
+        ])
 
         thin = Border(
             left=Side(style="thin"),
@@ -1182,7 +1261,7 @@ class BlindListenApp(tk.Tk):
             top=Side(style="thin"),
             bottom=Side(style="thin"),
         )
-        for sheet in (ws, ws2):
+        for sheet in (ws, ws2, ws3):
             for cell in sheet[1]:
                 cell.font = Font(bold=True)
                 cell.alignment = Alignment(horizontal="center")
