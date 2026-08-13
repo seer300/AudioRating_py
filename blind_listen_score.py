@@ -60,17 +60,18 @@ except ImportError:
 MUSIC_DIR_NAME = "music"
 
 # 七个场景文件夹名（顺序即测评顺序）
-SCENE_FOLDERS = ["A", "B", "C", "D", "E", "F", "G"]
+SCENE_FOLDERS = ["A", "B", "C", "D", "E", "F", "G", "H"]
 
 # 场景对外展示名（与 SCENE_FOLDERS 一一对应；可改成中文场景名）
 SCENE_DISPLAY_NAMES = [
-    "场景1",
-    "场景2",
-    "场景3",
-    "场景4",
-    "场景5",
-    "场景6",
-    "场景7",
+    "场景1:人声质量评分",
+    "场景2:噪声场景-1",
+    "场景3:噪声场景-2",
+    "场景4:噪声场景-3",
+    "场景5:噪声场景-4",
+    "场景6:噪声场景-5",
+    "场景7:噪声场景-6",
+    "场景8:噪声场景-7",
 ]
 
 # 每个场景期望的音频数量
@@ -848,7 +849,7 @@ class BlindListenApp(tk.Tk):
         ttk.Label(frame, text="盲听音频评分", font=("", 18, "bold")).pack(pady=(0, 12))
         ttk.Label(
             frame,
-            text="开始前请输入评分人姓名。测评过程中界面仅显示编号，不显示真实文件名。",
+            text="开始前请输入评分人姓名。测评过程中界面仅显示音频编号，不显示真实文件名。测评完成后，将在当前目录下生成一个Excel文件。",
             wraplength=520,
             justify=tk.CENTER,
         ).pack(pady=(0, 24))
@@ -864,15 +865,18 @@ class BlindListenApp(tk.Tk):
 
         ttk.Button(frame, text="开始测评", command=self._start_eval).pack(pady=24)
 
+        # tip = (
+        #     # "音频已内置于程序中（打包后不可从外部替换）。\n"
+        #     f"场景: {', '.join(SCENE_FOLDERS)}（各约 {NUM_AUDIO_PER_SCENE} 条 wav）"
+        # )
         tip = (
-            "音频已内置于程序中（打包后不可从外部替换）。\n"
-            f"场景: {', '.join(SCENE_FOLDERS)}（各约 {NUM_AUDIO_PER_SCENE} 条 wav）"
+            f"一共8种场景（各 {NUM_AUDIO_PER_SCENE} 条 wav）, 预计需要30分钟完成"
         )
-        if not getattr(sys, "frozen", False):
-            tip = (
-                f"音频目录: {music_root()}\n"
-                f"场景: {', '.join(SCENE_FOLDERS)}（各约 {NUM_AUDIO_PER_SCENE} 条 wav）"
-            )
+        # if not getattr(sys, "frozen", False):
+        #     tip = (
+        #         # f"音频目录: {music_root()}\n"
+        #         f"场景: {', '.join(SCENE_FOLDERS)}（各约 {NUM_AUDIO_PER_SCENE} 条 wav）"
+        #     )
         if DEBUG_COPY_FIRST_SCENE_SCORES:
             tip += (
                 "\n\n【调试模式已开启】填完第1个场景后，"
