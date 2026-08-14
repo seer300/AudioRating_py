@@ -693,7 +693,7 @@ class AudioRow:
         score_frame.pack(fill=tk.X, pady=(8, 0))
 
         self.score_vars: Dict[str, tk.StringVar] = {}
-        self.score_widgets: Dict[str, ttk.Spinbox] = {}
+        self.score_widgets: Dict[str, ttk.Entry] = {}
 
         vcmd = (self.frame.register(self._validate_score_key), "%P")
 
@@ -704,19 +704,19 @@ class AudioRow:
             ttk.Label(cell, text=title).pack(anchor="w")
             var = tk.StringVar(value="")
             self.score_vars[key] = var
-            spin = ttk.Spinbox(
+            entry = ttk.Entry(
                 cell,
-                from_=SCORE_MIN,
-                to=SCORE_MAX,
-                increment=SCORE_STEP,
                 textvariable=var,
                 width=10,
-                format="%.1f",
                 validate="key",
                 validatecommand=vcmd,
             )
-            spin.pack(fill=tk.X)
-            self.score_widgets[key] = spin
+            entry.pack(fill=tk.X)
+            # 禁用滚轮改分（避免误触）
+            entry.bind("<MouseWheel>", lambda e: "break")
+            entry.bind("<Button-4>", lambda e: "break")
+            entry.bind("<Button-5>", lambda e: "break")
+            self.score_widgets[key] = entry
 
     def pack(self, **kwargs) -> None:
         self.frame.pack(**kwargs)
@@ -1108,7 +1108,7 @@ class BlindListenApp(tk.Tk):
         dim_names = "、".join(title for _k, title in dims)
         ttk.Label(
             header,
-            text=f"请为每条音频打分：从0.0到5.0，步进 0.1，鼠标滚轮可快速调整分数",
+            text="请为每条音频打分：0.0–5.0，步进 0.1（请手动输入）",
         ).pack(side=tk.RIGHT)
 
         # 左右分栏：左侧音频打分，右侧评分标准（常驻）
