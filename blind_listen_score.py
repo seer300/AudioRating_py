@@ -919,24 +919,10 @@ class ScoreRubricPanel(ttk.Frame):
             for lbl in body_labels:
                 lbl.configure(wraplength=new_wrap)
 
-        def _on_wheel(event):
-            if sys.platform == "darwin":
-                canvas.yview_scroll(-1 * int(event.delta), "units")
-            else:
-                canvas.yview_scroll(-1 * int(event.delta / 120), "units")
-            return "break"
-
-        def _on_linux_scroll(event):
-            canvas.yview_scroll(-1 if event.num == 4 else 1, "units")
-            return "break"
-
         canvas.bind("<Configure>", _on_canvas_configure)
         canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         vsb.pack(side=tk.RIGHT, fill=tk.Y)
-        for w in (canvas, inner):
-            w.bind("<MouseWheel>", _on_wheel)
-            w.bind("<Button-4>", _on_linux_scroll)
-            w.bind("<Button-5>", _on_linux_scroll)
+        # 右侧评分标准表禁用滚轮滚动，仅使用滚动条拖动
 
         for c, text in enumerate(headers):
             cell = ttk.Label(
@@ -971,9 +957,6 @@ class ScoreRubricPanel(ttk.Frame):
                 cell.grid(row=r, column=c, sticky="nsew")
                 if c > 0:
                     body_labels.append(cell)
-                    cell.bind("<MouseWheel>", _on_wheel)
-                    cell.bind("<Button-4>", _on_linux_scroll)
-                    cell.bind("<Button-5>", _on_linux_scroll)
 
 
 # =============================================================================
@@ -1156,7 +1139,7 @@ class BlindListenApp(tk.Tk):
         canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
-        # 左侧音频区滚轮（进入时绑定，避免与右侧标准表抢滚动）
+        # 左侧音频区滚轮：仅鼠标在左侧时生效，避免右侧也被带动
         def _on_mousewheel(event):
             if sys.platform == "darwin":
                 canvas.yview_scroll(-1 * int(event.delta), "units")
@@ -1178,7 +1161,8 @@ class BlindListenApp(tk.Tk):
 
         left.bind("<Enter>", _bind_left_wheel)
         left.bind("<Leave>", _unbind_left_wheel)
-        canvas.bind("<Enter>", _bind_left_wheel)
+        # 进入右侧时明确解绑，防止左侧 bind_all 仍滚动左侧列表
+        right_box.bind("<Enter>", _unbind_left_wheel)
         self._canvas = canvas
         _bind_left_wheel()
 
